@@ -18,6 +18,7 @@ from itertools import chain
 from typing import Dict
 import os
 import glob
+from sympy import Symbol, Function
 
 import hydra
 import matplotlib.pyplot as plt
@@ -177,21 +178,17 @@ def main(cfg: DictConfig):
     phi_norm = 4.12442e+00  
 
     original_eps = 8.854e-12
-    eps = original_eps * (phi_norm / rho_norm)
+    coeff = (phi_norm / (original_eps*rho_norm))
+    x, y = Symbol("x"), Symbol("y")
+    rho_var = Function('rho')(x, y)
 
-    # In normalized variable space, the physical epsilon (8.854e-12) combined
-    # with the normalization ratio (phi_norm / rho_norm) yields D ≈ 6.26e-23,
-    # which makes the Laplacian term vanish compared to rho — the PDE residual
-    # becomes |rho_normalized| (a constant), producing zero gradient signal.
-    #
-    # Fix: Use D=1.0 in the normalized equation: -laplacian(phi_n) = rho_n.
-    # This is the structure-preserving form of Poisson's equation where the
-    # exact physical scaling is already captured by the data loss. The PDE
-    # loss now enforces that the output respects the Laplacian-source
-    # relationship with O(1) coefficients, giving meaningful gradients.
+    # Create the source term Q = coeff * rho
+    # print(coeff)
+    Q_scaled = coeff * rho_var
+
     # poison = Diffusion(T='phi', D=eps, Q='rho', dim=2, time=False)
-    poison = Diffusion(T='phi', D=1.0, Q='rho', dim=2, time=False)
-    # poison.pprint()
+    poison = Diffusion(T='phi', D=1.0, Q=Q_scaled, dim=2, time=False)
+    poison.pprint()
     
     # forcing_fn = 1.0 * 4.49996e00 * 3.88433e-03  # after scaling
     # darcy = Diffusion(T="u", time=False, dim=2, D="k", Q=forcing_fn)
