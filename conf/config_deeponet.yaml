@@ -14,60 +14,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# hydra:
-#   job:
-#     chdir: True
-#   run:
-#     dir: ./outputs_poisson
-
-# start_lr: 0.001
-# gamma: 0.99948708
-# max_epochs: 3
-
-# physics_weight: 0.1
-
-# model:
-#   fno:
-#     in_channels: 1 # k-prime
-#     out_channels: 2 # u_branch, k_branch
-#     decoder_layers: 1
-#     decoder_layer_size: 32
-#     dimension: 2
-#     latent_channels: 32
-#     num_fno_layers: 4
-#     num_fno_modes: 12
-#     padding: 9
-#   fc: 
-#     in_features: 2 # x, y
-#     out_features: 2 # u_trunk, k_trunk
-#     layer_size: 128
-#     num_layers: 3
 hydra:
   job:
     chdir: True
   run:
-    dir: ./outputs_poisson
+    dir: ./outputs_poisson1
 
 start_lr: 0.001
-gamma: 0.99948708
-max_epochs: 100
+gamma: 0.9999948708
+max_epochs: 300
 
-physics_weight: 0.7
+physics_weight: 0.01
 
 model:
   fno:
-    in_channels: 1
-    out_channels: 1
+    in_channels: 1 # k-prime
+    out_channels: 2 # u_branch, k_branch
     decoder_layers: 1
-    decoder_layer_size: 32     # ← back to original
+    decoder_layer_size: 32
     dimension: 2
-    latent_channels: 32        # ← back to original
-    num_fno_layers: 4          # ← back to original
-    num_fno_modes: 12          # ← back to original
+    latent_channels: 32
+    num_fno_layers: 4
+    num_fno_modes: 12
     padding: 9
-  fc:
-    in_features: 2
-    out_features: 1
-    layer_size: 128            # ← back to original
-    num_layers: 3              # ← back to original
-    
+  fc: 
+    in_features: 2 # x, y
+    out_features: 2 # u_trunk, k_trunk
+    layer_size: 128
+    num_layers: 3
