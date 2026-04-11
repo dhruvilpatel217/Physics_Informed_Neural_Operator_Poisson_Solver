@@ -42,26 +42,28 @@ class HDF5MapStyleDataset(Dataset):
 
         # rho_norm = np.max(np.abs(data["rho"])) #global max
         # phi_norm = np.max(np.abs(data["potential"]))
-        rho_norm = 5.83456e+11  
-        phi_norm = 4.12442e+00
+        # rho_norm     = 1.16147e-08  #case2/out0
+        # phi_norm     = 6.55763e-01
         original_eps = 8.854e-12
+        rho_norm     = 1.23223e-08
+        phi_norm     = 9.21588e-01
 
         invar = torch.from_numpy(
-            (data["rho"][:, :257, :257]).astype(np.float32)
+            (data["rho"][:, :256, :256]).astype(np.float32)
         ) / rho_norm                                  
 
         # ── CHANGE 4: Output is phi instead of sol ────────────────────────────
         outvar = torch.from_numpy(
-            (data["potential"][:, :257, :257]).astype(np.float32)
+            (data["potential"][:, :256, :256]).astype(np.float32)
         ) / phi_norm                                    
 
         # Your Poisson dataset is 257×257.
-        x = np.linspace(0, 1, 257)
-        y = np.linspace(0, 1, 257)
+        x = np.linspace(0, 1, 256)
+        y = np.linspace(0, 1, 256)
 
         xx, yy = np.meshgrid(x, y)
-        x_invar = torch.from_numpy(xx.astype(np.float32)).view(1, 257, 257)
-        y_invar = torch.from_numpy(yy.astype(np.float32)).view(1, 257, 257)
+        x_invar = torch.from_numpy(xx.astype(np.float32)).view(1, 256, 256)
+        y_invar = torch.from_numpy(yy.astype(np.float32)).view(1, 256, 256)
 
         if self.device.type == "cuda":
             invar   = invar.cuda()
