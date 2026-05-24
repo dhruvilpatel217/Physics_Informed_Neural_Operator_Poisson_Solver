@@ -28,13 +28,13 @@
 - [Problem Statement](#-problem-statement)
 - [Why Not Classical or Standard Neural Solvers?](#-why-not-classical-or-standard-neural-solvers)
 - [Approach: Operator Learning](#-approach-operator-learning)
-- [Architecture](#-architecture)
+- [Architecture](#architecture)
 - [Dataset](#-dataset)
 - [Training](#-training)
 - [Inference Pipeline](#-inference-pipeline)
 - [Results](#-results)
 - [Key Contributions](#-key-contributions)
-- [Authors](#-authors)
+- [Authors](#authors)
 
 ---
 
@@ -104,6 +104,8 @@ Instead of learning one potential field, the model learns the **rule** that maps
 - **Fourier Neural Operator (FNO)** branch captures non-local electrostatic coupling efficiently in the frequency domain.
 
 ---
+
+<a name="architecture"></a>
 
 ## 🏗️ Architecture
 
@@ -323,6 +325,8 @@ The trained solver was **inserted into the live C++ PIC loop** at the field-solv
 4. **Boundary Enforcement & Validation** — Hard clamping for exact grounded wall conditions, validated against 4,002 unseen plasma scenario charge fields.
 
 ---
+
+<a name="authors"></a>
 
 ## 👨‍🔬 Authors
 
