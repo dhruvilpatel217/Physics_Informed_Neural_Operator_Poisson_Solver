@@ -1,132 +1,149 @@
-# predict_poisson.py
-# ─────────────────────────────────────────────────────────────────────────────
-# Single-sample Poisson solver inference.
-#
-# Accepts a 2D text file of doubles (space-separated, 257x257) as the charge
-# density (rho) input, internally wraps it into a temporary HDF5 file,
-# runs the exact same DeepONet model used during training, and produces:
-#   1. A 2D text file of the predicted potential  (like potential_sample)
-#   2. A 4-panel PNG visualisation (rho | predicted phi | expected phi | error)
-#      or a 2-panel PNG if no expected potential is given.
-#
-# Usage:
-#   python predict_poisson.py                             (defaults below)
-#   python predict_poisson.py --rho_file my_rho.txt
-#   python predict_poisson.py --rho_file rho_sample --expected_file potential_sample
-#   python predict_poisson.py --ckpt_dir ./outputs_poisson/checkpoints
-# ─────────────────────────────────────────────────────────────────────────────
-
-import argparse
 import os
-import tempfile
-from typing import Dict
-
+import argparse
 import h5py
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Dict
 from omegaconf import OmegaConf
+from skimage.metrics import structural_similarity as ssim_metric
 
 from physicsnemo.models.fno import FNO
 from physicsnemo.models.mlp import FullyConnected
-from physicsnemo.utils.checkpoint import load_checkpoint
 from physicsnemo.sym.key import Key
 from physicsnemo.sym.models.arch import Arch
+from physicsnemo.utils.checkpoint import load_checkpoint
+
+# ==========================================
+# GLOBAL PRECISION SETTING
+# ==========================================
+torch.set_default_dtype(torch.float64)
+
+# ==========================================
+# CONSTANTS (Must match training!)
+# ==========================================
+GRID_SIZE = 256
+RHO_NORM  = np.float64(1.232227672511348e-08)
+PHI_NORM  = np.float64(9.215881670158015e-01)
 
 
-# ── Normalization constants (identical to training) ──────────────────────────
-RHO_NORM = 5.83456e+11
-PHI_NORM = 4.12442e+00
-GRID_SIZE = 257
-
-
-# ── Model wrapper — exact copy from poisson_fno_train.py ────────────────────
 class MdlsSymWrapper(Arch):
     """
-    DeepONet wrapper: FNO branch (rho → features) * FC trunk (x,y → features).
-    Identical to the class used during training so that checkpoint weights
-    load without any shape or key mismatches.
+    Wrapper model for float64 precision inference.
+    Exactly matches the architecture used in training and predict_validation_full.py.
     """
-
-    def __init__(
-        self,
-        input_keys=[Key("rho"), Key("x"), Key("y")],
-        output_keys=[Key("phi")],
-        trunk_net=None,
-        branch_net=None,
-    ):
-        super().__init__(
-            input_keys=input_keys,
-            output_keys=output_keys,
-        )
-        self.branch_net = branch_net
-        self.trunk_net = trunk_net
+    def __init__(self, input_keys, output_keys, trunk_net, branch_net, num_basis=1):
+        super().__init__(input_keys=input_keys, output_keys=output_keys)
+        self.branch_net = branch_net.to(torch.float64)
+        self.trunk_net  = trunk_net.to(torch.float64)
+        self.num_basis  = num_basis
 
     def forward(self, dict_tensor: Dict[str, torch.Tensor]):
-        # Concatenate x, y inputs for the trunk MLP
         xy_input_shape = dict_tensor["x"].shape
+
+        # Ensure inputs are cast to double precision
         xy = self.concat_input(
-            {
-                rho: dict_tensor[rho].view(xy_input_shape[0], -1, 1)
-                for rho in ["x", "y"]
-            },
+            {k: dict_tensor[k].view(xy_input_shape[0], -1, 1).to(torch.float64) for k in ["x", "y"]},
             ["x", "y"],
             detach_dict=self.detach_key_dict,
             dim=-1,
         )
         fc_out = self.trunk_net(xy)
 
-        # FNO branch processes the charge density
-        fno_out = self.branch_net(dict_tensor["rho_prime"])
+        # Branch network input cast to double
+        fno_out = self.branch_net(dict_tensor["rho_prime"].to(torch.float64))
 
-        # Reshape trunk output to spatial grid
         fc_out = fc_out.view(
             xy_input_shape[0], -1, xy_input_shape[-2], xy_input_shape[-1]
         )
 
-        # Element-wise product of branch and trunk outputs
-        out = fc_out * fno_out
+        if self.num_basis > 1:
+            out = (fc_out * fno_out).sum(dim=1, keepdim=True)
+        else:
+            out = fc_out * fno_out
 
-        return self.split_output(out, self.output_key_dict, dim=1)
+        phi = out[:, 0:1, :, :]
 
+        # Strictly Enforce Physical Dirichlet Boundary Condition
+        boundary_mean = (
+            phi[:, :, 0,  :].mean(dim=-1) +
+            phi[:, :, -1, :].mean(dim=-1) +
+            phi[:, :, :,  0].mean(dim=-1) +
+            phi[:, :, :, -1].mean(dim=-1)
+        ) / 4.0
 
-def load_rho_from_textfile(filepath: str) -> np.ndarray:
-    """Load a 257x257 space-separated text file of doubles."""
-    rho = np.loadtxt(filepath)
-    if rho.shape != (GRID_SIZE, GRID_SIZE):
-        raise ValueError(
-            f"Expected rho shape ({GRID_SIZE}, {GRID_SIZE}), got {rho.shape}"
-        )
-    return rho
+        phi = phi - boundary_mean.unsqueeze(-1).unsqueeze(-1)
 
+        # Hard-zero boundaries
+        phi[:, :, 0,  :] = 0.0
+        phi[:, :, -1, :] = 0.0
+        phi[:, :, :,  0] = 0.0
+        phi[:, :, :, -1] = 0.0
 
-def rho_to_temp_hdf5(rho: np.ndarray, tmp_dir: str) -> str:
-    """
-    Convert a raw 2D rho array into a single-sample HDF5 file with the same
-    layout the training dataset uses: keys 'rho' and 'potential', each with
-    shape (1, 1, 257, 257).  The potential is filled with zeros (placeholder)
-    because we only need the rho for inference.
-    """
-    tmp_path = os.path.join(tmp_dir, "single_input.hdf5")
-    rho_4d = rho[np.newaxis, np.newaxis, :, :].astype(np.float32)  # (1,1,257,257)
-    with h5py.File(tmp_path, "w") as f:
-        f.create_dataset("rho", data=rho_4d)
-        # Placeholder potential (zeros) — not used during prediction
-        f.create_dataset("potential", data=np.zeros_like(rho_4d))
-    return tmp_path
+        return self.split_output(phi, self.output_key_dict, dim=1)
 
 
-def build_coordinate_grids(device: torch.device):
-    """Build the (x, y) meshgrid tensors used by the trunk network."""
-    lin = np.linspace(0, 1, GRID_SIZE)
-    xx, yy = np.meshgrid(lin, lin)
-    x_t = torch.from_numpy(xx.astype(np.float32)).view(1, 1, GRID_SIZE, GRID_SIZE).to(device)
-    y_t = torch.from_numpy(yy.astype(np.float32)).view(1, 1, GRID_SIZE, GRID_SIZE).to(device)
-    return x_t, y_t
+def save_sample_figure(rho_grid, phi_pred, phi_true, error_abs, sample_idx, save_path, rmse, ape, ssim):
+    """Save a 4-panel figure: Input rho, Predicted phi, True phi, Absolute error."""
+    fig, axes = plt.subplots(1, 4, figsize=(26, 6))
+
+    im0 = axes[0].imshow(rho_grid, cmap="RdBu_r")
+    plt.colorbar(im0, ax=axes[0])
+    axes[0].set_title("Input rho")
+
+    vmin = min(phi_pred.min(), phi_true.min())
+    vmax = max(phi_pred.max(), phi_true.max())
+
+    im1 = axes[1].imshow(phi_pred, cmap="viridis", vmin=vmin, vmax=vmax)
+    plt.colorbar(im1, ax=axes[1])
+    axes[1].set_title("Predicted phi")
+
+    im2 = axes[2].imshow(phi_true, cmap="viridis", vmin=vmin, vmax=vmax)
+    plt.colorbar(im2, ax=axes[2])
+    axes[2].set_title("True phi")
+
+    im3 = axes[3].imshow(error_abs, cmap="hot")
+    plt.colorbar(im3, ax=axes[3])
+    axes[3].set_title("Absolute error")
+
+    fig.suptitle(f"Grid {sample_idx} | RMSE: {rmse:.4e} | APE: {ape:.4f}% | SSIM: {ssim:.6f}", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
 
 
-def build_model(cfg, device: torch.device):
-    """Instantiate branch (FNO) + trunk (FC) + wrapper, matching training."""
+def main():
+    parser = argparse.ArgumentParser(description="Predict on specific grid indices from HDF5.")
+    parser.add_argument(
+        "--grids", type=int, nargs='+', required=True,
+        help="List of grid indices to predict on (e.g., --grids 692 695 915)"
+    )
+    parser.add_argument(
+        "--validation_hdf5", type=str, default="./testing_64.hdf5",
+        help="Path to the testing HDF5 dataset."
+    )
+    parser.add_argument(
+        "--ckpt_dir", type=str, default="./outputs_poisson_v5/checkpoints",
+        help="Path to the directory containing trained model checkpoints."
+    )
+    parser.add_argument(
+        "--config", type=str, default="./conf/config_deeponet.yaml",
+        help="Path to the Hydra YAML config used during training."
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default="./predictions_selected_grids",
+        help="Directory to store the resulting .txt files and images."
+    )
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device} (Double Precision)")
+
+    # ── 1. Load Config ────────────────────────────────────────────────────────
+    cfg = OmegaConf.load(os.path.abspath(args.config))
+    num_basis = int(cfg.model.get("num_basis", 1))
+
+    # ── 2. Build Model (explicit float64 on all sub-models) ───────────────────
     model_branch = FNO(
         in_channels=cfg.model.fno.in_channels,
         out_channels=cfg.model.fno.out_channels,
@@ -137,166 +154,111 @@ def build_model(cfg, device: torch.device):
         num_fno_layers=cfg.model.fno.num_fno_layers,
         num_fno_modes=cfg.model.fno.num_fno_modes,
         padding=cfg.model.fno.padding,
-    ).to(device)
+    ).to(device).to(torch.float64)
 
     model_trunk = FullyConnected(
         in_features=cfg.model.fc.in_features,
         out_features=cfg.model.fc.out_features,
         layer_size=cfg.model.fc.layer_size,
         num_layers=cfg.model.fc.num_layers,
-    ).to(device)
+    ).to(device).to(torch.float64)
 
     model = MdlsSymWrapper(
         input_keys=[Key("rho_prime"), Key("x"), Key("y")],
         output_keys=[Key("phi")],
         trunk_net=model_trunk,
         branch_net=model_branch,
-    ).to(device)
+        num_basis=num_basis,
+    ).to(device).to(torch.float64)
 
-    return model, model_branch, model_trunk
+    # ── 3. Load Weights ──────────────────────────────────────────────────────
+    ckpt_dir = os.path.abspath(args.ckpt_dir)
+    print(f"Loading checkpoint from: {ckpt_dir}")
+    load_checkpoint(ckpt_dir, models=[model_branch, model_trunk], device=device)
+    model.eval()
 
+    # ── 4. Coordinate Grids ──────────────────────────────────────────────────
+    lin = np.linspace(0, 1, GRID_SIZE, dtype=np.float64)
+    xx, yy = np.meshgrid(lin, lin)
+    x_t = torch.from_numpy(xx).view(1, 1, GRID_SIZE, GRID_SIZE).to(device, dtype=torch.float64)
+    y_t = torch.from_numpy(yy).view(1, 1, GRID_SIZE, GRID_SIZE).to(device, dtype=torch.float64)
 
-def save_potential_textfile(phi: np.ndarray, filepath: str):
-    """Save the 257x257 predicted potential as a space-separated text file."""
-    np.savetxt(filepath, phi, fmt="%.6e")
-    print(f"Predicted potential saved to: {filepath}")
+    # ── 5. Setup Output Directory ────────────────────────────────────────────
+    output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Outputs will be saved to: {output_dir}\n")
 
+    # ── 6. Process Specific Grids ────────────────────────────────────────────
+    with h5py.File(os.path.abspath(args.validation_hdf5), "r") as h5f:
+        total_samples = h5f["rho"].shape[0]
 
-def visualize(rho: np.ndarray, phi_pred: np.ndarray,
-              phi_expected, save_path: str):
-    """
-    Generate the output image.
-    If phi_expected is provided  → 4-panel: rho | pred | expected | error
-    Otherwise                    → 2-panel: rho | pred
-    """
-    has_expected = phi_expected is not None
+        for grid_idx in args.grids:
+            if grid_idx < 0 or grid_idx >= total_samples:
+                print(f"⚠️ Warning: Grid {grid_idx} is out of bounds (0 to {total_samples-1}). Skipping.")
+                continue
 
-    ncols = 4 if has_expected else 2
-    fig, axes = plt.subplots(1, ncols, figsize=(7.5 * ncols, 6))
+            print(f"Processing Grid {grid_idx}...")
+            
+            # Create subfolder for this specific grid
+            grid_dir = os.path.join(output_dir, f"grid_{grid_idx:04d}")
+            os.makedirs(grid_dir, exist_ok=True)
 
-    # Panel 1: Input charge density
-    im0 = axes[0].imshow(rho, cmap="RdBu_r")
-    plt.colorbar(im0, ax=axes[0])
-    axes[0].set_title("Input Charge Density (ρ)")
+            # Load raw physical data as float64
+            rho_raw  = h5f["rho"][grid_idx].squeeze().astype(np.float64)
+            phi_true = h5f["potential"][grid_idx].squeeze().astype(np.float64)
 
-    # Panel 2: Predicted potential
-    im1 = axes[1].imshow(phi_pred, cmap="viridis")
-    plt.colorbar(im1, ax=axes[1])
-    axes[1].set_title("Predicted Potential (φ)")
+            # Save input and expected as txt
+            np.savetxt(os.path.join(grid_dir, "rho_input.txt"), rho_raw, fmt="%.6e")
+            np.savetxt(os.path.join(grid_dir, "phi_expected.txt"), phi_true, fmt="%.6e")
 
-    if has_expected:
-        # Use shared color limits from the expected potential
-        vmin, vmax = phi_expected.min(), phi_expected.max()
-        axes[1].images[0].set_clim(vmin, vmax)
-
-        # Panel 3: Expected potential
-        im2 = axes[2].imshow(phi_expected, vmin=vmin, vmax=vmax, cmap="viridis")
-        plt.colorbar(im2, ax=axes[2])
-        axes[2].set_title("Expected Potential (φ)")
-
-        # Panel 4: Absolute error
-        diff = np.abs(phi_pred - phi_expected)
-        rel_err = diff.mean() / (np.abs(phi_expected).mean() + 1e-12)
-        im3 = axes[3].imshow(diff, cmap="hot")
-        plt.colorbar(im3, ax=axes[3])
-        axes[3].set_title(f"|Error|  —  Mean rel err: {rel_err:.4%}")
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Visualisation saved to: {save_path}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Run single-sample Poisson solver inference on a 2D rho text file."
-    )
-    parser.add_argument(
-        "--rho_file", type=str, default="rho_sample",
-        help="Path to the input rho text file (257x257, space-separated doubles)."
-    )
-    parser.add_argument(
-        "--expected_file", type=str, default=None,
-        help="Optional path to the expected potential text file for comparison."
-    )
-    parser.add_argument(
-        "--ckpt_dir", type=str, default="./outputs_poisson/checkpoints",
-        help="Path to the directory containing trained model checkpoints."
-    )
-    parser.add_argument(
-        "--config", type=str, default="./conf/config_deeponet.yaml",
-        help="Path to the Hydra YAML config used during training."
-    )
-    parser.add_argument(
-        "--output_potential", type=str, default="predicted_potential.txt",
-        help="Path for the output predicted-potential text file."
-    )
-    parser.add_argument(
-        "--output_image", type=str, default="prediction_result.png",
-        help="Path for the output visualisation PNG."
-    )
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # ── Load model config ────────────────────────────────────────────────────
-    cfg = OmegaConf.load(args.config)
-
-    # ── Read the input rho text file ─────────────────────────────────────────
-    print(f"Reading rho from: {args.rho_file}")
-    rho_raw = load_rho_from_textfile(args.rho_file)
-
-    # ── Convert to temporary HDF5 (backend conversion as requested) ──────────
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        hdf5_path = rho_to_temp_hdf5(rho_raw, tmp_dir)
-        print(f"Temporary HDF5 created at: {hdf5_path}")
-
-        # ── Normalise rho and prepare model input tensor ─────────────────────
-        rho_tensor = (
-            torch.from_numpy(rho_raw.astype(np.float32))
-            .unsqueeze(0).unsqueeze(0)           # (1, 1, 257, 257)
-            / RHO_NORM
-        ).to(device)
-
-        x_coord, y_coord = build_coordinate_grids(device)
-
-        # ── Build and load model ─────────────────────────────────────────────
-        model, model_branch, model_trunk = build_model(cfg, device)
-
-        print(f"Loading checkpoint from: {args.ckpt_dir}")
-        load_checkpoint(
-            args.ckpt_dir,
-            models=[model_branch, model_trunk],
-            device=device,
-        )
-        model.eval()
-        print("Checkpoint loaded successfully.")
-
-        # ── Inference ────────────────────────────────────────────────────────
-        with torch.no_grad():
-            out = model(
-                {"rho_prime": rho_tensor, "x": x_coord, "y": y_coord}
+            # Normalize rho for model input
+            rho_tensor = (
+                torch.from_numpy(rho_raw / RHO_NORM)
+                .unsqueeze(0).unsqueeze(0).to(device, dtype=torch.float64)
             )
 
-    # ── Denormalise the prediction back to physical units ────────────────────
-    phi_pred = out["phi"][0, 0].cpu().numpy() * PHI_NORM
-    print(f"Predicted potential range: [{phi_pred.min():.6e}, {phi_pred.max():.6e}]")
+            # Forward pass
+            with torch.no_grad():
+                out = model({"rho_prime": rho_tensor, "x": x_t, "y": y_t})
 
-    # ── Save predicted potential as a 2D text file ───────────────────────────
-    save_potential_textfile(phi_pred, args.output_potential)
+            # Denormalize phi
+            phi_pred = out["phi"][0, 0].cpu().numpy() * PHI_NORM
 
-    # ── Load expected potential if provided ──────────────────────────────────
-    phi_expected = None
-    if args.expected_file is not None:
-        print(f"Reading expected potential from: {args.expected_file}")
-        phi_expected = load_rho_from_textfile(args.expected_file)
+            # Save predicted phi
+            np.savetxt(os.path.join(grid_dir, "phi_pred.txt"), phi_pred, fmt="%.6e")
 
-    # ── Generate visualisation ───────────────────────────────────────────────
-    visualize(rho_raw, phi_pred, phi_expected, args.output_image)
+            # Metrics
+            error     = phi_pred - phi_true
+            error_abs = np.abs(error)
+            rmse      = float(np.sqrt(np.mean(error_abs ** 2)))
 
-    print("Done.")
+            denom = np.where(np.abs(phi_true) < 1e-15, 1.0, np.abs(phi_true))
+            ape   = float(np.mean(error_abs / denom) * 100)
 
+            pred_norm = phi_pred / PHI_NORM
+            true_norm = phi_true / PHI_NORM
+            data_range = true_norm.max() - true_norm.min()
+            if data_range == 0:
+                data_range = 1.0
+            sample_ssim = float(ssim_metric(true_norm, pred_norm, data_range=data_range))
+
+            print(f"  RMSE: {rmse:.4e} | APE: {ape:.4f}% | SSIM: {sample_ssim:.6f}")
+
+            # Save image
+            img_path = os.path.join(grid_dir, f"result.png")
+            save_sample_figure(
+                rho_grid=rho_raw,
+                phi_pred=phi_pred,
+                phi_true=phi_true,
+                error_abs=error_abs,
+                sample_idx=grid_idx,
+                save_path=img_path,
+                rmse=rmse,
+                ape=ape,
+                ssim=sample_ssim
+            )
+            
+    print(f"\nAll selected grids processed successfully!")
 
 if __name__ == "__main__":
     main()
