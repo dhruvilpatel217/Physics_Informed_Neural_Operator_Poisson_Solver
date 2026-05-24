@@ -6,10 +6,6 @@
 
 *Learning the Poisson operator ρ → ϕ for repeated electrostatic PIC field solves*
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue?style=flat-square&logo=python)](https://python.org)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?style=flat-square&logo=pytorch)](https://pytorch.org)
-[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
-
 | Metric | Value |
 |--------|-------|
 | 📉 Average RMSE | `4.2178 × 10⁻² V` |
